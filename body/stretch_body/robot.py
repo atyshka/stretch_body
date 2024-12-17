@@ -223,7 +223,25 @@ class Robot(Device):
         self.status['end_of_arm'] = self.end_of_arm.status
         self.devices={ 'pimu':self.pimu, 'base':self.base, 'lift':self.lift, 'arm': self.arm, 'head': self.head, 'wacc':self.wacc, 'end_of_arm':self.end_of_arm}
 
-        self.dynamixel_chains = ['head', 'end_of_arm']
+        self.dynamixel_chains = {
+            'head': self.head,
+            'end_of_arm': self.end_of_arm
+        }
+
+        self.custom_chains = {}
+
+        self.motors = { 'base':self.base, 'lift':self.lift, 'arm': self.arm, 'head': self.head, 'end_of_arm':self.end_of_arm}
+        # Add custom motor chains
+        if 'custom_chains' in self.params:
+            for chain in self.params['custom_chains']:
+                module_name = chain['py_module_name']
+                class_name = chain['py_class_name']
+                self.devices[chain['name']] = getattr(importlib.import_module(module_name), class_name)()
+                self.status[chain['name']] = self.devices[chain['name']].status
+                self.dynamixel_chains[chain['name']] = self.devices[chain['name']]
+                self.custom_chains[chain['name']] = self.devices[chain['name']]
+                self.motors[chain['name']] = self.devices[chain['name']]
+
         self.GLOBAL_EXCEPTIONS_LIST = []
         threading.excepthook = self.custom_excepthook
 
@@ -299,8 +317,8 @@ class Robot(Device):
         signal.signal(signal.SIGINT, hello_utils.thread_service_shutdown)
 
         self.non_dxl_thread = NonDXLStatusThread(self, target_rate_hz=self.params['rates']['NonDXLStatusThread_Hz'])
-        for chain in self.dynamixel_chains:
-            self.dxl_status_threads[chain] = DXLStatusThread(self, chain, target_rate_hz=self.params['rates']['DXLStatusThread_Hz'])
+        for chain_name in self.dynamixel_chains.keys():
+            self.dxl_status_threads[chain_name] = DXLStatusThread(self, chain_name, target_rate_hz=self.params['rates']['DXLStatusThread_Hz'])
         self.sys_thread = SystemMonitorThread(self, target_rate_hz=self.params['rates']['SystemMonitorThread_Hz'])
         self.collision_mgmt_thread = CollisionMonitorThread(self, target_rate_hz=100)
 
@@ -312,9 +330,9 @@ class Robot(Device):
                 time.sleep(0.01)
 
         if start_dxl_thread:
-            for chain in self.dynamixel_chains:
-                self.dxl_status_threads[chain].daemon = True
-                self.dxl_status_threads[chain].start()
+            for chain_name in self.dynamixel_chains:
+                self.dxl_status_threads[chain_name].daemon = True
+                self.dxl_status_threads[chain_name].start()
 
         if start_sys_mon_thread:
             self.sys_thread.daemon = True
@@ -448,8 +466,8 @@ class Robot(Device):
         threads.append(threading.Thread(target=check_wait, args=(self.base.wait_while_is_moving,)))
         threads.append(threading.Thread(target=check_wait, args=(self.arm.wait_while_is_moving,)))
         threads.append(threading.Thread(target=check_wait, args=(self.lift.wait_while_is_moving,)))
-        threads.append(threading.Thread(target=check_wait, args=(self.head.wait_until_at_setpoint,)))
-        threads.append(threading.Thread(target=check_wait, args=(self.end_of_arm.wait_until_at_setpoint,)))
+        for chain_name, chain in self.dynamixel_chains.items():
+            threads.append(threading.Thread(target=check_wait, args=(chain.wait_until_at_setpoint,)))
         [thread.start() for thread in threads]
         [thread.join() for thread in threads]
         return all(done)
@@ -458,9 +476,7 @@ class Robot(Device):
 
 
     def is_trajectory_active(self):
-        return self.arm.is_trajectory_active() or self.lift.is_trajectory_active() or \
-               self.base.is_trajectory_active() or self.end_of_arm.is_trajectory_active() or \
-               self.head.is_trajectory_active()
+        return any(motor.is_trajectory_active() for motor in self.motors.values())
 
 
     def follow_trajectory(self):
@@ -479,16 +495,12 @@ class Robot(Device):
         if self.pimu.ts_last_motor_sync is None or sync_required:
             self.pimu.trigger_motor_sync()
 
-        success = success and self.end_of_arm.follow_trajectory(move_to_start_point=False)
-        success = success and self.head.follow_trajectory(move_to_start_point=False)
+        success = all(chain.follow_trajectory(move_to_start_point=False) for chain in self.dynamixel_chains.values())
         return success
 
     def stop_trajectory(self):
-        self.arm.stop_trajectory()
-        self.lift.stop_trajectory()
-        self.base.stop_trajectory()
-        self.end_of_arm.stop_trajectory()
-        self.head.stop_trajectory()
+        for motor in self.motors.values():
+            motor.stop_trajectory()
 
 # ##################Home and Stow #######################################
 
@@ -526,8 +538,11 @@ class Robot(Device):
         Blocking.
         """
         self.disable_collision_mgmt()
+        for chain in self.custom_chains.values():
+            chain.stow()
+
         self.head.move_to('head_pan', self.get_stow_pos('head_pan'))
-        self.head.move_to('head_tilt',self.get_stow_pos('head_pan'))
+        self.head.move_to('head_tilt',self.get_stow_pos('head_tilt'))
 
         lift_stowed=False
         pos_lift = self.get_stow_pos('lift')
@@ -576,6 +591,10 @@ class Robot(Device):
         Blocking.
         """
         self.disable_collision_mgmt()
+
+        for chain in self.custom_chains.values():
+            chain.home()
+
         if self.head is not None:
             print('--------- Homing Head ----')
             self.head.home()
@@ -640,11 +659,8 @@ class Robot(Device):
         self.base.update_trajectory()
 
     def _step_sentry(self):
-        self.head.step_sentry(self)
-        self.base.step_sentry(self)
-        self.arm.step_sentry(self)
-        self.lift.step_sentry(self)
-        self.end_of_arm.step_sentry(self)
+        for motor in self.motors.values():
+            motor.step_sentry(self)
     
     def start_event_loop(self):
         self.async_event_loop = asyncio.new_event_loop()
